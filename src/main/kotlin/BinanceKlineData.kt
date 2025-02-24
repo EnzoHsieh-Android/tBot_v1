@@ -1,5 +1,12 @@
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
+import kotlinx.serialization.json.JsonElement
+
+@Serializable
+data class StreamData(
+    @SerialName("stream") val stream: String,
+    @SerialName("data") val data: JsonElement  // 使用JsonElement來處理多種可能的數據類型
+)
 
 @Serializable
 data class BinanceKlineData(

@@ -2,6 +2,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
 
 @Serializable
+data class StreamTickerData(
+    @SerialName("stream") val stream: String,
+    @SerialName("data") val data: BinanceTickerData
+)
+
+@Serializable
 data class BinanceTickerData(
     @SerialName("e") val eventType: String,
     @SerialName("E") val eventTime: Long,

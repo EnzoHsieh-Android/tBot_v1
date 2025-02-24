@@ -78,8 +78,30 @@ class SMCAnalyzer {
         BULLISH, BEARISH
     }
 
+    private data class RiskManagement(
+        val entryPrice: Double,
+        val stopLoss: Double,
+        val targets: List<Target>,
+        val riskRewardRatio: Double
+    )
+
+    private data class Target(
+        val price: Double,
+        val percentage: Int  // 倉位比例
+    )
+
+    // 添加回調函數類型
+    private var onTradeSignal: (() -> Unit)? = null
+
+    // 設置回調函數的方法
+    fun setOnTradeSignalCallback(callback: () -> Unit) {
+        onTradeSignal = callback
+    }
+
     fun analyze(kline: Kline, interval: String) {
-        // 只處理已完成的K線，避免未完成K線的假信號
+        // 添加調試信息
+        //println("收到${interval}K線數據: 開盤:${kline.openPrice} 收盤:${kline.closePrice} 是否收盤:${kline.isClosed}")
+        
         if (kline.isClosed) {
             val buffer = klineBuffers[interval] ?: return
             buffer.add(kline)
@@ -89,49 +111,69 @@ class SMCAnalyzer {
                 buffer.removeAt(0)
             }
 
+            // 輸出當前緩衝區大小
+            println("${interval}緩衝區大小: ${buffer.size}/${bufferSizes[interval]}")
+
             // 確保所有時間週期都有足夠的數據進行分析
             if (klineBuffers.all { it.value.size >= 3 }) {
+                println("所有時間週期數據充足，開始分析市場結構")
                 analyzeMarketStructure()
+            } else {
+                // 輸出各時間週期的數據收集情況
+                klineBuffers.forEach { (interval, buffer) ->
+                    println("${interval}數據: ${buffer.size}/3")
+                }
             }
         }
     }
 
     private fun analyzeMarketStructure() {
-        // 獲取不同時間週期的K線數據
-        val mainTimeframe = klineBuffers["4h"]!!      // 4小時圖判斷主趨勢
-        val intermediateTimeframe = klineBuffers["1h"]!! // 1小時圖判斷中期趨勢
-        val shortTimeframe = klineBuffers["5m"]!!     // 5分鐘圖尋找進場點
+        try {
+            // 獲取不同時間週期的K線數據
+            val mainTimeframe = klineBuffers["4h"]!!
+            val intermediateTimeframe = klineBuffers["1h"]!!
+            val shortTimeframe = klineBuffers["5m"]!!
 
-        // 第一步：分析主要時間週期（4小時圖）
-        // 1. 尋找主要時間週期的訂單塊
-        val mainOrderBlocks = findOrderBlocks(mainTimeframe, "4h")
-        // 2. 尋找主要時間週期的公允價值缺口
-        val mainFVGs = findFairValueGaps(mainTimeframe)
-        // 3. 判斷主要趨勢方向
-        val mainTrend = analyzeTrend(mainTimeframe, "4h")
-        
-        // 只有在主趨勢明確（非中性）時繼續分析
-        if (mainTrend != Trend.NEUTRAL) {
-            // 第二步：分析中期時間週期（1小時圖）
-            val intermediateTrend = analyzeTrend(intermediateTimeframe, "1h")
-            
-            // 只有當主趨勢和中期趨勢一致時繼續分析
-            if (mainTrend == intermediateTrend) {
-                // 1. 尋找中期時間週期的訂單塊
-                val intermediateOrderBlocks = findOrderBlocks(intermediateTimeframe, "1h")
-                // 2. 尋找中期時間週期的公允價值缺口
-                val intermediateFVGs = findFairValueGaps(intermediateTimeframe)
+            // 第一步：分析主要時間週期（4小時圖）
+            println("分析4小時圖主趨勢...")
+            val mainOrderBlocks = findOrderBlocks(mainTimeframe, "4h")
+            val mainFVGs = findFairValueGaps(mainTimeframe)
+            val mainTrend = analyzeTrend(mainTimeframe, "4h")
+
+            // 輸出主要分析結果
+            println("4小時圖分析結果:")
+            println("- 趨勢: $mainTrend")
+            println("- 訂單塊數量: ${mainOrderBlocks.size}")
+            println("- FVG數量: ${mainFVGs.size}")
+
+            // 只有在主趨勢明確（非中性）時繼續分析
+            if (mainTrend != Trend.NEUTRAL) {
+                // 第二步：分析中期時間週期（1小時圖）
+                val intermediateTrend = analyzeTrend(intermediateTimeframe, "1h")
                 
-                // 第三步：在短期時間週期（5分鐘圖）尋找具體進場機會
-                analyzeEntryWithOrderBlocks(
-                    shortTimeframe,
-                    mainTrend,
-                    mainOrderBlocks,
-                    intermediateOrderBlocks,
-                    mainFVGs,
-                    intermediateFVGs
-                )
+                // 只有當主趨勢和中期趨勢一致時繼續分析
+                if (mainTrend == intermediateTrend) {
+                    // 1. 尋找中期時間週期的訂單塊
+                    val intermediateOrderBlocks = findOrderBlocks(intermediateTimeframe, "1h")
+                    // 2. 尋找中期時間週期的公允價值缺口
+                    val intermediateFVGs = findFairValueGaps(intermediateTimeframe)
+                    
+                    // 第三步：在短期時間週期（5分鐘圖）尋找具體進場機會
+                    analyzeEntryWithOrderBlocks(
+                        shortTimeframe,
+                        mainTrend,
+                        mainOrderBlocks,
+                        intermediateOrderBlocks,
+                        mainFVGs,
+                        intermediateFVGs
+                    )
+                }
+            } else {
+                println("主趨勢不明確，暫不產生交易信號")
             }
+        } catch (e: Exception) {
+            println("分析市場結構時出錯: ${e.message}")
+            e.printStackTrace()
         }
     }
 
@@ -230,7 +272,7 @@ class SMCAnalyzer {
                         currentPrice
                     )
                     
-                    printTradeSignal(current, klines[klines.size - 2], true, signalStrength)
+                    printTradeSignal(current, klines[klines.size - 2], true, signalStrength, mainOrderBlocks, mainFVGs)
                 }
             }
             
@@ -266,7 +308,7 @@ class SMCAnalyzer {
                         currentPrice
                     )
                     
-                    printTradeSignal(current, klines[klines.size - 2], false, signalStrength)
+                    printTradeSignal(current, klines[klines.size - 2], false, signalStrength, mainOrderBlocks, mainFVGs)
                 }
             }
             else -> {} // 不操作
@@ -659,8 +701,14 @@ class SMCAnalyzer {
         current: Kline, 
         previous: Kline, 
         isLong: Boolean,
-        signalStrength: Double
+        signalStrength: Double,
+        mainOrderBlocks: List<OrderBlock>,
+        mainFVGs: List<PriceRange>
     ) {
+        val riskManagement = calculateRiskManagement(
+            current, previous, isLong, mainOrderBlocks, mainFVGs
+        )
+        
         println(buildString {
             appendLine("========= SMC多時間週期分析信號 =========")
             appendLine("時間: ${formatTime(current.closeTime)}")
@@ -668,30 +716,195 @@ class SMCAnalyzer {
             appendLine("信號類型: ${if (isLong) "做多" else "做空"}")
             appendLine("信號強度: ${String.format("%.2f", signalStrength)}/100")
             appendLine("價格區間: ${current.lowPrice} - ${current.highPrice}")
-            appendLine("進場價格: ${current.closePrice}")
+            appendLine("進場價格: ${String.format("%.2f", riskManagement.entryPrice)}")
             appendLine("風險管理:")
-            appendLine("- 止損: ${if (isLong) previous.lowPrice else previous.highPrice}")
-            appendLine("- 目標: ${calculateTarget(
-                current.closePrice.toDouble(),
-                if (isLong) previous.lowPrice.toDouble() else previous.highPrice.toDouble(),
-                isLong
-            )}")
+            appendLine("- 止損: ${String.format("%.2f", riskManagement.stopLoss)}")
+            appendLine("- 目標位:")
+            riskManagement.targets.forEachIndexed { index, target ->
+                appendLine("  ${index + 1}) ${String.format("%.2f", target.price)} (平倉${target.percentage}%)")
+            }
+            appendLine("- 綜合風險報酬比: ${String.format("%.2f", riskManagement.riskRewardRatio)}")
             appendLine("=======================================")
         })
+
+        // 觸發回調，通知有新的交易信號
+        onTradeSignal?.invoke()
+    }
+
+    private fun calculateRiskManagement(
+        current: Kline,
+        previous: Kline,
+        isLong: Boolean,
+        mainOrderBlocks: List<OrderBlock>,
+        mainFVGs: List<PriceRange>
+    ): RiskManagement {
+        val entryPrice = current.closePrice.toDouble()
+        
+        // 根據SMC策略設置止損
+        val stopLoss = calculateSmartStopLoss(
+            current,
+            previous,
+            isLong,
+            mainOrderBlocks,
+            mainFVGs
+        )
+        
+        // 計算風險金額
+        val riskAmount = abs(entryPrice - stopLoss)
+        
+        // 根據市場結構設置多個目標位
+        val targets = calculateSmartTargets(
+            entryPrice,
+            stopLoss,
+            riskAmount,
+            isLong,
+            mainOrderBlocks,
+            mainFVGs
+        )
+        
+        // 計算綜合風險報酬比
+        val avgTarget = targets.sumOf { it.price * it.percentage } / 
+                       targets.sumOf { it.percentage.toDouble() }
+        val riskRewardRatio = abs(avgTarget - entryPrice) / riskAmount
+
+        return RiskManagement(entryPrice, stopLoss, targets, riskRewardRatio)
+    }
+
+    private fun calculateSmartStopLoss(
+        current: Kline,
+        previous: Kline,
+        isLong: Boolean,
+        mainOrderBlocks: List<OrderBlock>,
+        mainFVGs: List<PriceRange>
+    ): Double {
+        val baseStopLoss = if (isLong) previous.lowPrice.toDouble() else previous.highPrice.toDouble()
+        
+        // 尋找最近的訂單塊或FVG作為保護止損
+        val nearestStructure = if (isLong) {
+            // 做多時，找下方最近的看漲訂單塊或FVG
+            val nearestOB = mainOrderBlocks
+                .filter { it.type == OrderBlockType.BULLISH && it.endPrice < current.lowPrice.toDouble() }
+                .maxByOrNull { it.endPrice }
+            
+            val nearestFVG = mainFVGs
+                .filter { it.type == GapType.BULLISH && it.end < current.lowPrice.toDouble() }
+                .maxByOrNull { it.end }
+            
+            when {
+                nearestOB != null && nearestFVG != null -> 
+                    maxOf(nearestOB.endPrice, nearestFVG.end, baseStopLoss)
+                nearestOB != null -> maxOf(nearestOB.endPrice, baseStopLoss)
+                nearestFVG != null -> maxOf(nearestFVG.end, baseStopLoss)
+                else -> baseStopLoss
+            }
+        } else {
+            // 做空時，找上方最近的看跌訂單塊或FVG
+            val nearestOB = mainOrderBlocks
+                .filter { it.type == OrderBlockType.BEARISH && it.startPrice > current.highPrice.toDouble() }
+                .minByOrNull { it.startPrice }
+                
+            val nearestFVG = mainFVGs
+                .filter { it.type == GapType.BEARISH && it.start > current.highPrice.toDouble() }
+                .minByOrNull { it.start }
+                
+            when {
+                nearestOB != null && nearestFVG != null -> 
+                    minOf(nearestOB.startPrice, nearestFVG.start, baseStopLoss)
+                nearestOB != null -> minOf(nearestOB.startPrice, baseStopLoss)
+                nearestFVG != null -> minOf(nearestFVG.start, baseStopLoss)
+                else -> baseStopLoss
+            }
+        }
+        
+        // 添加額外的緩衝區
+        return if (isLong) {
+            nearestStructure * 0.997  // 下調0.3%作為緩衝
+        } else {
+            nearestStructure * 1.003  // 上調0.3%作為緩衝
+        }
+    }
+
+    private fun calculateSmartTargets(
+        entryPrice: Double,
+        stopLoss: Double,
+        riskAmount: Double,
+        isLong: Boolean,
+        mainOrderBlocks: List<OrderBlock>,
+        mainFVGs: List<PriceRange>
+    ): List<Target> {
+        val targets = mutableListOf<Target>()
+        
+        if (isLong) {
+            // 找出上方的阻力位（看跌訂單塊和FVG）
+            val resistances = (
+                mainOrderBlocks
+                    .filter { it.type == OrderBlockType.BEARISH && it.startPrice > entryPrice }
+                    .map { it.startPrice } +
+                mainFVGs
+                    .filter { it.type == GapType.BEARISH && it.start > entryPrice }
+                    .map { it.start }
+            ).sorted()
+            
+            // 根據阻力位設置目標
+            when {
+                resistances.isEmpty() -> {
+                    // 如果沒有明顯阻力位，使用風險比例設置目標
+                    targets.add(Target(entryPrice + riskAmount * 2, 50))  // 2R，平50%
+                    targets.add(Target(entryPrice + riskAmount * 3, 30))  // 3R，平30%
+                    targets.add(Target(entryPrice + riskAmount * 4, 20))  // 4R，平20%
+                }
+                else -> {
+                    // 使用阻力位設置目標
+                    var remainingPercentage = 100
+                    resistances.take(3).forEachIndexed { index, resistance ->
+                        val percentage = when (index) {
+                            0 -> 50
+                            1 -> 30
+                            else -> remainingPercentage
+                        }
+                        remainingPercentage -= percentage
+                        targets.add(Target(resistance * 0.997, percentage))  // 略低於阻力位
+                    }
+                }
+            }
+        } else {
+            // 找出下方的支撐位（看漲訂單塊和FVG）
+            val supports = (
+                mainOrderBlocks
+                    .filter { it.type == OrderBlockType.BULLISH && it.endPrice < entryPrice }
+                    .map { it.endPrice } +
+                mainFVGs
+                    .filter { it.type == GapType.BULLISH && it.end < entryPrice }
+                    .map { it.end }
+            ).sortedDescending()
+            
+            // 根據支撐位設置目標
+            when {
+                supports.isEmpty() -> {
+                    targets.add(Target(entryPrice - riskAmount * 2, 50))
+                    targets.add(Target(entryPrice - riskAmount * 3, 30))
+                    targets.add(Target(entryPrice - riskAmount * 4, 20))
+                }
+                else -> {
+                    var remainingPercentage = 100
+                    supports.take(3).forEachIndexed { index, support ->
+                        val percentage = when (index) {
+                            0 -> 50
+                            1 -> 30
+                            else -> remainingPercentage
+                        }
+                        remainingPercentage -= percentage
+                        targets.add(Target(support * 1.003, percentage))  // 略高於支撐位
+                    }
+                }
+            }
+        }
+        
+        return targets
     }
 
     private enum class Trend {
         UPTREND, DOWNTREND, NEUTRAL
-    }
-
-    private fun calculateTarget(entryPrice: Double, stopLoss: Double, isLong: Boolean): String {
-        val riskAmount = if (isLong) entryPrice - stopLoss else stopLoss - entryPrice
-        val target = if (isLong) {
-            entryPrice + (riskAmount * 2) // 2:1的獲利比率
-        } else {
-            entryPrice - (riskAmount * 2)
-        }
-        return String.format("%.2f", target)
     }
 
     private fun formatTime(timestamp: Long): String {
@@ -699,5 +912,11 @@ class SMCAnalyzer {
             .atZone(ZoneId.systemDefault())
             .toLocalDateTime()
             .toString()
+    }
+
+    // 獲取每個時間週期所需的K線數量
+    fun getRequiredKlineCount(interval: String): Int {
+        // 返回緩衝區大小加上一些額外的空間
+        return (bufferSizes[interval] ?: 20) + 5
     }
 } 
