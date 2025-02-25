@@ -16,42 +16,49 @@ class SMCAnalyzer {
         "5m" to 30
     )
 
-    // 為不同時間週期設置閾值
+    // 為不同時間週期設置閾值 - 優化比特幣市場
     private val thresholds = mapOf(
         "4h" to PriceThresholds(
-            minPriceChangePercent = 1.5,    // 4小時圖要求更大的變動幅度
-            minVolumeMultiplier = 1.8,      // 交易量需要高於平均的1.8倍
-            minSwingPoints = 3              // 至少需要3個擺動點確認
+            minPriceChangePercent = 1.2,    // 降低到1.2%，適應BTC波動特性
+            minVolumeMultiplier = 1.6,      // 降低到1.6倍
+            minSwingPoints = 3              // 保持不變
         ),
         "1h" to PriceThresholds(
-            minPriceChangePercent = 0.8,    // 1小時圖的變動幅度要求
-            minVolumeMultiplier = 1.5,      // 交易量需要高於平均的1.5倍
-            minSwingPoints = 2              // 至少需要2個擺動點確認
+            minPriceChangePercent = 0.7,    // 降低到0.7%
+            minVolumeMultiplier = 1.4,      // 降低到1.4倍
+            minSwingPoints = 2              // 保持不變
         ),
         "5m" to PriceThresholds(
-            minPriceChangePercent = 0.3,    // 5分鐘圖的最小變動幅度
-            minVolumeMultiplier = 1.3,      // 交易量需要高於平均的1.3倍
-            minSwingPoints = 2              // 至少需要2個擺動點確認
+            minPriceChangePercent = 0.4,    // 提高到0.4%，減少噪音
+            minVolumeMultiplier = 1.5,      // 提高到1.5倍
+            minSwingPoints = 2              // 保持不變
         )
     )
 
-    // 新增訂單塊和流動性區域的閾值設置
+    // 新增訂單塊和流動性區域的閾值設置 - 優化比特幣市場
     private val orderBlockThresholds = mapOf(
         "4h" to OrderBlockThresholds(
-            minVolumeMagnitude = 2.5,     // 訂單塊的最小交易量倍數
-            maxCandleCount = 5,           // 向前尋找訂單塊的K線數量
-            priceRejectionPercent = 1.2   // 價格拒絕區域的百分比
+            minVolumeMagnitude = 2.0,     // 降低到2.0倍
+            maxCandleCount = 5,           // 保持不變
+            priceRejectionPercent = 1.0   // 降低到1.0%
         ),
         "1h" to OrderBlockThresholds(
-            minVolumeMagnitude = 2.0,
-            maxCandleCount = 8,
-            priceRejectionPercent = 0.8
+            minVolumeMagnitude = 1.8,     // 降低到1.8倍
+            maxCandleCount = 8,           // 保持不變
+            priceRejectionPercent = 0.7   // 降低到0.7%
         ),
         "5m" to OrderBlockThresholds(
-            minVolumeMagnitude = 1.8,
-            maxCandleCount = 12,
-            priceRejectionPercent = 0.5
+            minVolumeMagnitude = 1.6,     // 降低到1.6倍
+            maxCandleCount = 12,          // 保持不變
+            priceRejectionPercent = 0.4   // 降低到0.4%
         )
+    )
+    
+    // 新增FVG閾值設置 - 優化比特幣市場
+    private val fvgThresholds = mapOf(
+        "4h" to 0.5,   // 4小時圖需要至少0.5%的缺口
+        "1h" to 0.3,   // 1小時圖需要至少0.3%的缺口
+        "5m" to 0.15   // 5分鐘圖需要至少0.15%的缺口
     )
 
     private data class PriceThresholds(
@@ -71,7 +78,8 @@ class SMCAnalyzer {
         val endPrice: Double,
         val volume: Double,
         val type: OrderBlockType,          // BULLISH或BEARISH
-        val strength: Double               // 訂單塊強度評分
+        val strength: Double,              // 訂單塊強度評分
+        val creationTime: Long = 0         // 創建時間
     )
 
     private enum class OrderBlockType {
@@ -137,7 +145,7 @@ class SMCAnalyzer {
             // 第一步：分析主要時間週期（4小時圖）
             println("分析4小時圖主趨勢...")
             val mainOrderBlocks = findOrderBlocks(mainTimeframe, "4h")
-            val mainFVGs = findFairValueGaps(mainTimeframe)
+            val mainFVGs = findFairValueGaps(mainTimeframe, "4h")
             val mainTrend = analyzeTrend(mainTimeframe, "4h")
 
             // 輸出主要分析結果
@@ -156,7 +164,7 @@ class SMCAnalyzer {
                     // 1. 尋找中期時間週期的訂單塊
                     val intermediateOrderBlocks = findOrderBlocks(intermediateTimeframe, "1h")
                     // 2. 尋找中期時間週期的公允價值缺口
-                    val intermediateFVGs = findFairValueGaps(intermediateTimeframe)
+                    val intermediateFVGs = findFairValueGaps(intermediateTimeframe, "1h")
                     
                     // 第三步：在短期時間週期（5分鐘圖）尋找具體進場機會
                     analyzeEntryWithOrderBlocks(
@@ -237,82 +245,134 @@ class SMCAnalyzer {
         intermediateFVGs: List<PriceRange>
     ) {
         val current = klines.last()
+        val previous = klines[klines.size - 2]
         val currentPrice = current.closePrice.toDouble()
+        
+        // 計算當前價格與各個結構的距離
+        val priceDistances = mutableListOf<Pair<String, Double>>()
         
         when (trend) {
             Trend.UPTREND -> {
                 // 檢查是否在主要和中期的看漲訂單塊或FVG附近
-                val nearMainBullishOB = mainOrderBlocks.any { ob -> 
-                    ob.type == OrderBlockType.BULLISH && 
-                    isNearPrice(currentPrice, ob.startPrice, ob.endPrice)
+                val bullishOBs = mainOrderBlocks.filter { it.type == OrderBlockType.BULLISH } +
+                                intermediateOrderBlocks.filter { it.type == OrderBlockType.BULLISH }
+                
+                val bullishFVGs = mainFVGs.filter { it.type == GapType.BULLISH } +
+                                 intermediateFVGs.filter { it.type == GapType.BULLISH }
+                
+                // 計算與訂單塊的距離
+                bullishOBs.forEach { ob ->
+                    if (isNearPrice(currentPrice, ob.startPrice, ob.endPrice)) {
+                        val distance = abs(currentPrice - (ob.startPrice + ob.endPrice) / 2) / currentPrice * 100
+                        priceDistances.add("OB" to distance)
+                    }
                 }
                 
-                val nearIntermediateBullishOB = intermediateOrderBlocks.any { ob ->
-                    ob.type == OrderBlockType.BULLISH &&
-                    isNearPrice(currentPrice, ob.startPrice, ob.endPrice)
+                // 計算與FVG的距離
+                bullishFVGs.forEach { fvg ->
+                    if (isNearPrice(currentPrice, fvg.start, fvg.end)) {
+                        val distance = abs(currentPrice - (fvg.start + fvg.end) / 2) / currentPrice * 100
+                        priceDistances.add("FVG(${String.format("%.1f", fvg.strength)}%)" to distance)
+                    }
                 }
                 
-                val nearMainBullishFVG = mainFVGs.any { gap ->
-                    gap.type == GapType.BULLISH &&
-                    isNearPrice(currentPrice, gap.start, gap.end)
-                }
-                
-                val nearIntermediateBullishFVG = intermediateFVGs.any { gap ->
-                    gap.type == GapType.BULLISH &&
-                    isNearPrice(currentPrice, gap.start, gap.end)
-                }
-                
-                // 同時滿足主要和中期時間週期的確認
-                if ((nearMainBullishOB || nearMainBullishFVG) && 
-                    (nearIntermediateBullishOB || nearIntermediateBullishFVG)) {
-                    // 計算信號強度
-                    val signalStrength = calculateSignalStrength(
-                        mainOrderBlocks.filter { it.type == OrderBlockType.BULLISH },
-                        intermediateOrderBlocks.filter { it.type == OrderBlockType.BULLISH },
-                        currentPrice
-                    )
+                // 如果有足夠接近的結構，生成做多信號
+                if (priceDistances.isNotEmpty()) {
+                    // 計算信號強度 - 基於結構數量和距離
+                    val signalStrength = calculateSignalStrength(priceDistances, bullishOBs, bullishFVGs)
                     
-                    printTradeSignal(current, klines[klines.size - 2], true, signalStrength, mainOrderBlocks, mainFVGs)
+                    // 只有當信號強度足夠時才生成交易信號
+                    if (signalStrength > 60) {
+                        printTradeSignal(
+                            current,
+                            previous,
+                            true, // 做多
+                            signalStrength,
+                            mainOrderBlocks,
+                            mainFVGs
+                        )
+                    } else {
+                        println("做多信號強度不足: $signalStrength/100，不產生交易信號")
+                    }
                 }
             }
             
             Trend.DOWNTREND -> {
                 // 檢查是否在主要和中期的看跌訂單塊或FVG附近
-                val nearMainBearishOB = mainOrderBlocks.any { ob ->
-                    ob.type == OrderBlockType.BEARISH &&
-                    isNearPrice(currentPrice, ob.startPrice, ob.endPrice)
+                val bearishOBs = mainOrderBlocks.filter { it.type == OrderBlockType.BEARISH } +
+                                intermediateOrderBlocks.filter { it.type == OrderBlockType.BEARISH }
+                
+                val bearishFVGs = mainFVGs.filter { it.type == GapType.BEARISH } +
+                                 intermediateFVGs.filter { it.type == GapType.BEARISH }
+                
+                // 計算與訂單塊的距離
+                bearishOBs.forEach { ob ->
+                    if (isNearPrice(currentPrice, ob.startPrice, ob.endPrice)) {
+                        val distance = abs(currentPrice - (ob.startPrice + ob.endPrice) / 2) / currentPrice * 100
+                        priceDistances.add("OB" to distance)
+                    }
                 }
                 
-                val nearIntermediateBearishOB = intermediateOrderBlocks.any { ob ->
-                    ob.type == OrderBlockType.BEARISH &&
-                    isNearPrice(currentPrice, ob.startPrice, ob.endPrice)
+                // 計算與FVG的距離
+                bearishFVGs.forEach { fvg ->
+                    if (isNearPrice(currentPrice, fvg.start, fvg.end)) {
+                        val distance = abs(currentPrice - (fvg.start + fvg.end) / 2) / currentPrice * 100
+                        priceDistances.add("FVG(${String.format("%.1f", fvg.strength)}%)" to distance)
+                    }
                 }
                 
-                val nearMainBearishFVG = mainFVGs.any { gap ->
-                    gap.type == GapType.BEARISH &&
-                    isNearPrice(currentPrice, gap.start, gap.end)
-                }
-                
-                val nearIntermediateBearishFVG = intermediateFVGs.any { gap ->
-                    gap.type == GapType.BEARISH &&
-                    isNearPrice(currentPrice, gap.start, gap.end)
-                }
-                
-                // 同時滿足主要和中期時間週期的確認
-                if ((nearMainBearishOB || nearMainBearishFVG) && 
-                    (nearIntermediateBearishOB || nearIntermediateBearishFVG)) {
-                    // 計算信號強度
-                    val signalStrength = calculateSignalStrength(
-                        mainOrderBlocks.filter { it.type == OrderBlockType.BEARISH },
-                        intermediateOrderBlocks.filter { it.type == OrderBlockType.BEARISH },
-                        currentPrice
-                    )
+                // 如果有足夠接近的結構，生成做空信號
+                if (priceDistances.isNotEmpty()) {
+                    // 計算信號強度 - 基於結構數量和距離
+                    val signalStrength = calculateSignalStrength(priceDistances, bearishOBs, bearishFVGs)
                     
-                    printTradeSignal(current, klines[klines.size - 2], false, signalStrength, mainOrderBlocks, mainFVGs)
+                    // 只有當信號強度足夠時才生成交易信號
+                    if (signalStrength > 60) {
+                        printTradeSignal(
+                            current,
+                            previous,
+                            false, // 做空
+                            signalStrength,
+                            mainOrderBlocks,
+                            mainFVGs
+                        )
+                    } else {
+                        println("做空信號強度不足: $signalStrength/100，不產生交易信號")
+                    }
                 }
             }
-            else -> {} // 不操作
+            
+            else -> { /* 中性趨勢不產生信號 */ }
         }
+    }
+
+    // 計算信號強度
+    private fun calculateSignalStrength(
+        priceDistances: List<Pair<String, Double>>,
+        orderBlocks: List<OrderBlock>,
+        fvgs: List<PriceRange>
+    ): Double {
+        // 基礎分數 - 基於結構數量
+        var strength = 50.0 + (priceDistances.size * 5.0)
+        
+        // 根據距離調整分數 - 距離越近分數越高
+        val avgDistance = priceDistances.map { it.second }.average()
+        strength -= avgDistance * 2
+        
+        // 根據FVG強度調整分數
+        val avgFVGStrength = fvgs.map { it.strength }.average()
+        if (!avgFVGStrength.isNaN()) {
+            strength += avgFVGStrength / 2
+        }
+        
+        // 根據訂單塊強度調整分數
+        val avgOBStrength = orderBlocks.map { it.strength }.average()
+        if (!avgOBStrength.isNaN()) {
+            strength += avgOBStrength / 2
+        }
+        
+        // 確保分數在0-100範圍內
+        return strength.coerceIn(0.0, 100.0)
     }
 
     // 檢查價格是否在指定範圍附近（允許一定的緩衝區）
@@ -321,343 +381,157 @@ class SMCAnalyzer {
         return price >= (rangeStart - buffer) && price <= (rangeEnd + buffer)
     }
 
-    // 計算信號強度
-    private fun calculateSignalStrength(
-        mainOrderBlocks: List<OrderBlock>,
-        intermediateOrderBlocks: List<OrderBlock>,
-        currentPrice: Double
-    ): Double {
-        // 找到最近的訂單塊
-        val nearestMainOB = mainOrderBlocks.minByOrNull { 
-            minOf(abs(currentPrice - it.startPrice), abs(currentPrice - it.endPrice))
-        }
-        val nearestIntermediateOB = intermediateOrderBlocks.minByOrNull {
-            minOf(abs(currentPrice - it.startPrice), abs(currentPrice - it.endPrice))
-        }
-        
-        // 綜合評分（滿分100）
-        var score = 0.0
-        
-        // 主時間週期訂單塊評分（最高60分）
-        if (nearestMainOB != null) {
-            score += nearestMainOB.strength * 0.6
-        }
-        
-        // 中期時間週期訂單塊評分（最高40分）
-        if (nearestIntermediateOB != null) {
-            score += nearestIntermediateOB.strength * 0.4
-        }
-        
-        return score
-    }
-
     private fun findOrderBlocks(klines: List<Kline>, interval: String): List<OrderBlock> {
-        val threshold = orderBlockThresholds[interval] ?: orderBlockThresholds["1h"]!!
         val orderBlocks = mutableListOf<OrderBlock>()
+        val threshold = orderBlockThresholds[interval] ?: orderBlockThresholds["1h"]!!
         
-        // 計算基準交易量（用於判斷高交易量K線）
-        val avgVolume = klines.takeLast(threshold.maxCandleCount)
-            .map { it.volume.toDouble() }
-            .average()
-
-        // 向前尋找可能的訂單塊
-        for (i in klines.size - 3 downTo maxOf(0, klines.size - threshold.maxCandleCount)) {
-            val current = klines[i]
-            val next = klines[i + 1]
-            val afterNext = klines[i + 2]
-            val currentVolume = current.volume.toDouble()
+        println("開始尋找${interval}訂單塊，K線數量: ${klines.size}")
+        
+        // 需要至少5根K線才能形成訂單塊
+        if (klines.size < 5) return orderBlocks
+        
+        // 獲取當前價格
+        val currentPrice = klines.last().closePrice.toDouble()
+        
+        // 計算平均交易量
+        val avgVolume = klines.takeLast(10).map { it.volume.toDouble() }.average()
+        
+        // 向後查找可能的訂單塊
+        for (i in 4 until klines.size) {
+            val candles = klines.subList(i - 4, i + 1)
             
-            // 判斷看漲訂單塊的條件：
-            // 1. 當前K線成交量顯著高於平均
-            // 2. 當前K線為陽線
-            // 3. 下一根K線回調
-            // 4. 之後開始反轉向上
-            if (isBullishOrderBlock(current, next, afterNext, currentVolume, avgVolume, threshold)) {
-                orderBlocks.add(OrderBlock(
-                    startPrice = current.lowPrice.toDouble(),
-                    endPrice = current.highPrice.toDouble(),
-                    volume = currentVolume,
-                    type = OrderBlockType.BULLISH,
-                    strength = calculateOrderBlockStrength(currentVolume, avgVolume, current, next, interval)
-                ))
-            }
+            // 檢查是否有趨勢反轉
+            val beforeTrend = detectMiniTrend(candles.subList(0, 3))
+            val afterTrend = detectMiniTrend(candles.subList(2, 5))
             
-            // 判斷看跌訂單塊的條件：
-            // 1. 當前K線成交量顯著高於平均
-            // 2. 當前K線為陰線
-            // 3. 下一根K線反彈
-            // 4. 之後開始繼續下跌
-            if (isBearishOrderBlock(current, next, afterNext, currentVolume, avgVolume, threshold)) {
-                orderBlocks.add(OrderBlock(
-                    startPrice = current.lowPrice.toDouble(),
-                    endPrice = current.highPrice.toDouble(),
-                    volume = currentVolume,
-                    type = OrderBlockType.BEARISH,
-                    strength = calculateOrderBlockStrength(currentVolume, avgVolume, current, next, interval)
-                ))
+            // 只有在趨勢反轉時才考慮訂單塊
+            if (beforeTrend != Trend.NEUTRAL && afterTrend != Trend.NEUTRAL && beforeTrend != afterTrend) {
+                val potentialOB = candles[2] // 反轉前的最後一根K線
+                val obVolume = potentialOB.volume.toDouble()
+                
+                // 檢查交易量是否足夠大
+                if (obVolume > avgVolume * threshold.minVolumeMagnitude) {
+                    val isBullish = afterTrend == Trend.UPTREND
+                    
+                    // 根據趨勢方向確定訂單塊類型和價格範圍
+                    val obType = if (isBullish) OrderBlockType.BULLISH else OrderBlockType.BEARISH
+                    
+                    // 對於看漲訂單塊，使用下跌K線的下半部分
+                    // 對於看跌訂單塊，使用上漲K線的上半部分
+                    val (startPrice, endPrice) = if (isBullish) {
+                        val open = potentialOB.openPrice.toDouble()
+                        val close = potentialOB.closePrice.toDouble()
+                        val low = potentialOB.lowPrice.toDouble()
+                        val mid = (open + close) / 2
+                        Pair(low, mid)
+                    } else {
+                        val open = potentialOB.openPrice.toDouble()
+                        val close = potentialOB.closePrice.toDouble()
+                        val high = potentialOB.highPrice.toDouble()
+                        val mid = (open + close) / 2
+                        Pair(mid, high)
+                    }
+                    
+                    // 計算訂單塊強度
+                    val strength = calculateOrderBlockStrength(
+                        potentialOB,
+                        obVolume / avgVolume,
+                        candles,
+                        interval
+                    )
+                    
+                    // 檢查訂單塊是否仍然有效（未被價格穿越）
+                    val isValid = if (isBullish) {
+                        currentPrice > endPrice // 價格在看漲訂單塊上方
+                    } else {
+                        currentPrice < startPrice // 價格在看跌訂單塊下方
+                    }
+                    
+                    // 只添加有效的訂單塊
+                    if (isValid) {
+                        orderBlocks.add(OrderBlock(
+                            startPrice = startPrice,
+                            endPrice = endPrice,
+                            volume = obVolume,
+                            type = obType,
+                            strength = strength,
+                            creationTime = potentialOB.closeTime
+                        ))
+                    }
+                }
             }
         }
         
-        return orderBlocks
-    }
-
-    private fun isBullishOrderBlock(
-        current: Kline,
-        next: Kline,
-        afterNext: Kline,
-        currentVolume: Double,
-        avgVolume: Double,
-        threshold: OrderBlockThresholds
-    ): Boolean {
-        val currentClose = current.closePrice.toDouble()
-        val currentOpen = current.openPrice.toDouble()
-        val nextLow = next.lowPrice.toDouble()
-        val afterNextLow = afterNext.lowPrice.toDouble()
+        // 按強度排序並只保留最強的10個訂單塊
+        val sortedBlocks = orderBlocks.sortedByDescending { it.strength }.take(10)
         
-        return currentVolume > avgVolume * threshold.minVolumeMagnitude && // 交易量條件
-               currentClose > currentOpen && // 收陽
-               nextLow < currentOpen && // 下一根下跌
-               afterNextLow > nextLow && // 之後開始反轉
-               (currentClose - currentOpen) / currentOpen * 100 > threshold.priceRejectionPercent // 足夠的漲幅
-    }
-
-    private fun isBearishOrderBlock(
-        current: Kline,
-        next: Kline,
-        afterNext: Kline,
-        currentVolume: Double,
-        avgVolume: Double,
-        threshold: OrderBlockThresholds
-    ): Boolean {
-        val currentClose = current.closePrice.toDouble()
-        val currentOpen = current.openPrice.toDouble()
-        val nextHigh = next.highPrice.toDouble()
-        val afterNextHigh = afterNext.highPrice.toDouble()
+        if (sortedBlocks.isNotEmpty()) {
+            println("找到 ${sortedBlocks.size} 個有效${interval}訂單塊:")
+            sortedBlocks.forEach { ob ->
+                println("類型: ${ob.type}, 範圍: ${String.format("%.4f", ob.startPrice)} - ${String.format("%.4f", ob.endPrice)}, 強度: ${String.format("%.2f", ob.strength)}")
+            }
+        } else {
+            println("未找到任何有效${interval}訂單塊")
+        }
         
-        return currentVolume > avgVolume * threshold.minVolumeMagnitude && // 交易量條件
-               currentClose < currentOpen && // 收陰
-               nextHigh > currentOpen && // 下一根上漲
-               afterNextHigh < nextHigh && // 之後開始反轉
-               (currentOpen - currentClose) / currentOpen * 100 > threshold.priceRejectionPercent // 足夠的跌幅
+        return sortedBlocks
     }
 
+    // 檢測小趨勢方向
+    private fun detectMiniTrend(candles: List<Kline>): Trend {
+        if (candles.size < 3) return Trend.NEUTRAL
+        
+        val first = candles[0]
+        val last = candles[candles.size - 1]
+        
+        val firstClose = first.closePrice.toDouble()
+        val lastClose = last.closePrice.toDouble()
+        
+        // 計算收盤價變化百分比
+        val changePercent = (lastClose - firstClose) / firstClose * 100
+        
+        return when {
+            changePercent > 0.5 -> Trend.UPTREND
+            changePercent < -0.5 -> Trend.DOWNTREND
+            else -> Trend.NEUTRAL
+        }
+    }
+
+    // 計算訂單塊強度
     private fun calculateOrderBlockStrength(
-        volume: Double,
-        avgVolume: Double,
-        current: Kline,
-        next: Kline,
+        ob: Kline,
+        volumeRatio: Double,
+        surroundingCandles: List<Kline>,
         interval: String
     ): Double {
-        // 基礎分數組成（總分100分）：
-        // 1. 交易量強度（35分）- 提高權重因為BTC交易量很重要
-        // 2. K線形態評分（25分）- 降低權重因為BTC波動較大
-        // 3. 價格拒絕程度（25分）- 提高權重因為BTC的價格拒絕更明顯
-        // 4. 市場反應評分（15分）- 降低權重因為BTC後續反應可能較劇烈
-
-        // 1. 交易量強度評分（最高35分）
-        val volumeRatio = volume / avgVolume
-        val volumeScore = when (interval) {
-            "4h" -> when {
-                volumeRatio >= 3.5 -> 35.0  // BTC 4小時圖需要更大的交易量
-                volumeRatio >= 3.0 -> 30.0
-                volumeRatio >= 2.5 -> 25.0
-                volumeRatio >= 2.0 -> 20.0
-                else -> 15.0
-            }
-            "1h" -> when {
-                volumeRatio >= 3.0 -> 35.0
-                volumeRatio >= 2.5 -> 30.0
-                volumeRatio >= 2.0 -> 25.0
-                volumeRatio >= 1.5 -> 20.0
-                else -> 15.0
-            }
-            else -> when {  // 5分鐘
-                volumeRatio >= 2.5 -> 35.0
-                volumeRatio >= 2.0 -> 30.0
-                volumeRatio >= 1.5 -> 25.0
-                volumeRatio >= 1.2 -> 20.0
-                else -> 15.0
-            }
+        // 基礎分數 - 基於交易量
+        var strength = 50.0 + (volumeRatio - 1) * 10
+        
+        // 根據K線實體大小調整分數
+        val bodySize = abs(ob.closePrice.toDouble() - ob.openPrice.toDouble())
+        val totalSize = ob.highPrice.toDouble() - ob.lowPrice.toDouble()
+        val bodySizeRatio = if (totalSize > 0) bodySize / totalSize else 0.0
+        
+        // 實體越大，訂單塊越強
+        strength += bodySizeRatio * 20
+        
+        // 根據時間週期調整權重
+        strength *= when(interval) {
+            "4h" -> 1.3  // 4小時圖的訂單塊更重要
+            "1h" -> 1.1  // 1小時圖的訂單塊次之
+            else -> 1.0  // 5分鐘圖的訂單塊權重正常
         }
-
-        // 2. K線形態評分（最高25分）
-        val candleScore = calculateCandleScore(current, interval)
-
-        // 3. 價格拒絕程度評分（最高25分）
-        val rejectionScore = calculateRejectionScore(current, next, interval)
-
-        // 4. 市場反應評分（最高15分）
-        val marketReactionScore = calculateMarketReactionScore(current, next, interval)
-
-        return volumeScore + candleScore + rejectionScore + marketReactionScore
+        
+        // 確保分數在0-100範圍內
+        return strength.coerceIn(0.0, 100.0)
     }
 
-    // 評估K線形態 - 針對BTC調整
-    private fun calculateCandleScore(kline: Kline, interval: String): Double {
-        val open = kline.openPrice.toDouble()
-        val close = kline.closePrice.toDouble()
-        val high = kline.highPrice.toDouble()
-        val low = kline.lowPrice.toDouble()
-        
-        val bodySize = abs(close - open)
-        val upperWick = high - maxOf(open, close)
-        val lowerWick = minOf(open, close) - low
-        val totalSize = high - low
-
-        val bodySizeRatio = bodySize / totalSize
-        val wickRatio = (upperWick + lowerWick) / totalSize
-
-        // BTC的K線通常波動較大，所以放寬標準
-        return when (interval) {
-            "4h" -> when {
-                bodySizeRatio >= 0.65 && wickRatio <= 0.35 -> 25.0
-                bodySizeRatio >= 0.55 && wickRatio <= 0.45 -> 20.0
-                bodySizeRatio >= 0.45 && wickRatio <= 0.55 -> 15.0
-                else -> 10.0
-            }
-            "1h" -> when {
-                bodySizeRatio >= 0.60 && wickRatio <= 0.40 -> 25.0
-                bodySizeRatio >= 0.50 && wickRatio <= 0.50 -> 20.0
-                bodySizeRatio >= 0.40 && wickRatio <= 0.60 -> 15.0
-                else -> 10.0
-            }
-            else -> when {  // 5分鐘
-                bodySizeRatio >= 0.55 && wickRatio <= 0.45 -> 25.0
-                bodySizeRatio >= 0.45 && wickRatio <= 0.55 -> 20.0
-                bodySizeRatio >= 0.35 && wickRatio <= 0.65 -> 15.0
-                else -> 10.0
-            }
-        }
-    }
-
-    // 評估價格拒絕程度 - 針對BTC調整
-    private fun calculateRejectionScore(current: Kline, next: Kline, interval: String): Double {
-        val currentClose = current.closePrice.toDouble()
-        val currentOpen = current.openPrice.toDouble()
-        val currentHigh = current.highPrice.toDouble()
-        val currentLow = current.lowPrice.toDouble()
-        
-        val nextHigh = next.highPrice.toDouble()
-        val nextLow = next.lowPrice.toDouble()
-        
-        // 計算當前K線的移動幅度和整體範圍
-        val currentMove = abs(currentClose - currentOpen)
-        val currentRange = currentHigh - currentLow
-        
-        // 計算實體佔整體範圍的比例（用於評估拒絕的質量）
-        val bodyToRangeRatio = currentMove / currentRange
-        
-        // 計算價格拒絕的百分比
-        val rejectionPercent = (currentMove / currentOpen) * 100
-        
-        // 計算下一根K線的反應程度
-        val isBullish = currentClose > currentOpen
-        val nextReaction = if (isBullish) {
-            (currentClose - nextLow) / currentClose * 100
-        } else {
-            (nextHigh - currentClose) / currentClose * 100
-        }
-
-        // 當前K線評分（最高15分）：
-        // - 價格拒絕幅度（10分）
-        // - 實體佔比質量（5分）
-        val rejectionScore = when (interval) {
-            "4h" -> when {
-                rejectionPercent >= 3.0 -> 10.0
-                rejectionPercent >= 2.0 -> 8.0
-                rejectionPercent >= 1.5 -> 6.0
-                else -> 4.0
-            }
-            "1h" -> when {
-                rejectionPercent >= 2.0 -> 10.0
-                rejectionPercent >= 1.5 -> 8.0
-                rejectionPercent >= 1.0 -> 6.0
-                else -> 4.0
-            }
-            else -> when {
-                rejectionPercent >= 1.5 -> 10.0
-                rejectionPercent >= 1.0 -> 8.0
-                rejectionPercent >= 0.7 -> 6.0
-                else -> 4.0
-            }
-        }
-
-        // 實體佔比評分
-        val qualityScore = when {
-            bodyToRangeRatio >= 0.7 -> 5.0  // 高質量的價格拒絕
-            bodyToRangeRatio >= 0.5 -> 4.0
-            bodyToRangeRatio >= 0.3 -> 3.0
-            else -> 2.0
-        }
-
-        // 下一根K線的反應評分（最高10分）
-        val nextScore = when (interval) {
-            "4h" -> when {
-                nextReaction >= 2.0 -> 10.0
-                nextReaction >= 1.5 -> 8.0
-                nextReaction >= 1.0 -> 6.0
-                else -> 4.0
-            }
-            "1h" -> when {
-                nextReaction >= 1.5 -> 10.0
-                nextReaction >= 1.0 -> 8.0
-                nextReaction >= 0.7 -> 6.0
-                else -> 4.0
-            }
-            else -> when {
-                nextReaction >= 1.0 -> 10.0
-                nextReaction >= 0.7 -> 8.0
-                nextReaction >= 0.5 -> 6.0
-                else -> 4.0
-            }
-        }
-
-        return rejectionScore + qualityScore + nextScore
-    }
-
-    // 評估市場反應 - 針對BTC調整
-    private fun calculateMarketReactionScore(
-        current: Kline, 
-        next: Kline, 
-        interval: String
-    ): Double {
-        val currentClose = current.closePrice.toDouble()
-        val currentOpen = current.openPrice.toDouble()
-        val nextHigh = next.highPrice.toDouble()
-        val nextLow = next.lowPrice.toDouble()
-        
-        val isBullish = currentClose > currentOpen
-        val reactionMove = if (isBullish) {
-            (currentOpen - nextLow) / currentOpen * 100
-        } else {
-            (nextHigh - currentOpen) / currentOpen * 100
-        }
-
-        // BTC的反應幅度通常較大
-        return when (interval) {
-            "4h" -> when {
-                reactionMove >= 2.0 -> 15.0
-                reactionMove >= 1.5 -> 12.0
-                reactionMove >= 1.0 -> 9.0
-                else -> 6.0
-            }
-            "1h" -> when {
-                reactionMove >= 1.5 -> 15.0
-                reactionMove >= 1.0 -> 12.0
-                reactionMove >= 0.7 -> 9.0
-                else -> 6.0
-            }
-            else -> when {  // 5分鐘
-                reactionMove >= 1.0 -> 15.0
-                reactionMove >= 0.7 -> 12.0
-                reactionMove >= 0.5 -> 9.0
-                else -> 6.0
-            }
-        }
-    }
-
-    private fun findFairValueGaps(klines: List<Kline>): List<PriceRange> {
+    private fun findFairValueGaps(klines: List<Kline>, interval: String): List<PriceRange> {
         val gaps = mutableListOf<PriceRange>()
+        println("開始尋找${interval} FVG，K線數量: ${klines.size}")
+        
+        // 獲取當前時間週期的FVG閾值
+        val minGapPercent = fvgThresholds[interval] ?: 0.2
         
         // 需要至少3根K線才能形成FVG
         for (i in 2 until klines.size) {
@@ -665,32 +539,91 @@ class SMCAnalyzer {
             val second = klines[i - 1]
             val third = klines[i]
             
-            // 看漲FVG：第一根K線的低點高於第三根K線的高點
-            if (first.lowPrice.toDouble() > third.highPrice.toDouble()) {
-                gaps.add(PriceRange(
-                    start = third.highPrice.toDouble(),
-                    end = first.lowPrice.toDouble(),
-                    type = GapType.BULLISH
-                ))
+            val firstHigh = first.highPrice.toDouble()
+            val firstLow = first.lowPrice.toDouble()
+            val secondHigh = second.highPrice.toDouble()
+            val secondLow = second.lowPrice.toDouble()
+            val thirdHigh = third.highPrice.toDouble()
+            val thirdLow = third.lowPrice.toDouble()
+            
+            // 計算價格移動的方向
+            val firstMove = second.closePrice.toDouble() - first.closePrice.toDouble()
+            val secondMove = third.closePrice.toDouble() - second.closePrice.toDouble()
+            
+            // 看漲FVG：
+            // 1. 第二根K線的低點高於第三根K線的高點
+            // 2. 價格先下跌後上漲
+            if (secondLow > thirdHigh && firstMove < 0 && secondMove > 0) {
+                val gapSize = secondLow - thirdHigh
+                val averagePrice = (firstHigh + thirdLow) / 2
+                
+                // 使用時間週期特定的閾值
+                if (gapSize / averagePrice > minGapPercent / 100) {
+                    gaps.add(PriceRange(
+                        start = thirdHigh,
+                        end = secondLow,
+                        type = GapType.BULLISH,
+                        strength = gapSize / averagePrice * 100, // 缺口強度
+                        creationTime = third.closeTime // 記錄創建時間
+                    ))
+                }
             }
             
-            // 看跌FVG：第一根K線的高點低於第三根K線的低點
-            if (first.highPrice.toDouble() < third.lowPrice.toDouble()) {
-                gaps.add(PriceRange(
-                    start = first.highPrice.toDouble(),
-                    end = third.lowPrice.toDouble(),
-                    type = GapType.BEARISH
-                ))
+            // 看跌FVG：
+            // 1. 第二根K線的高點低於第三根K線的低點
+            // 2. 價格先上漲後下跌
+            if (secondHigh < thirdLow && firstMove > 0 && secondMove < 0) {
+                val gapSize = thirdLow - secondHigh
+                val averagePrice = (firstLow + thirdHigh) / 2
+                
+                // 使用時間週期特定的閾值
+                if (gapSize / averagePrice > minGapPercent / 100) {
+                    gaps.add(PriceRange(
+                        start = secondHigh,
+                        end = thirdLow,
+                        type = GapType.BEARISH,
+                        strength = gapSize / averagePrice * 100, // 缺口強度
+                        creationTime = third.closeTime // 記錄創建時間
+                    ))
+                }
             }
         }
         
-        return gaps
+        // 獲取當前價格
+        val currentPrice = klines.last().closePrice.toDouble()
+        
+        // 過濾掉已經被價格穿越的FVG
+        val validGaps = gaps.filter { gap ->
+            when (gap.type) {
+                GapType.BULLISH -> currentPrice < gap.end  // 價格在看漲FVG下方或內部
+                GapType.BEARISH -> currentPrice > gap.start // 價格在看跌FVG上方或內部
+            }
+        }
+        
+        // 按缺口大小排序
+        val sortedGaps = validGaps.sortedByDescending { abs(it.end - it.start) }
+        
+        // 只保留最近的10個FVG
+        val recentGaps = sortedGaps.take(10)
+        
+        if (recentGaps.isNotEmpty()) {
+            println("找到 ${recentGaps.size} 個有效${interval} FVG:")
+            recentGaps.forEach { gap ->
+                println("類型: ${gap.type}, 範圍: ${String.format("%.4f", gap.start)} - ${String.format("%.4f", gap.end)}, 強度: ${String.format("%.2f", gap.strength)}%")
+            }
+        } else {
+            println("未找到任何有效${interval} FVG")
+        }
+        
+        return recentGaps
     }
 
     private data class PriceRange(
         val start: Double,
         val end: Double,
-        val type: GapType
+        val type: GapType,
+        val strength: Double = 0.0, // 缺口強度（百分比）
+        val creationTime: Long = 0  // 創建時間
     )
 
     private enum class GapType {
@@ -709,26 +642,182 @@ class SMCAnalyzer {
             current, previous, isLong, mainOrderBlocks, mainFVGs
         )
         
+        // 計算當前價格與進場價格的差距
+        val currentPrice = current.closePrice.toDouble()
+        val entryPriceDiff = ((riskManagement.entryPrice - currentPrice) / currentPrice * 100)
+        val entryPriceDiffStr = String.format("%.2f", abs(entryPriceDiff)) + "%"
+        
+        // 計算風險比例
+        val riskPercentage = abs(riskManagement.entryPrice - riskManagement.stopLoss) / riskManagement.entryPrice * 100
+        
+        // 獲取相關的市場結構
+        val relevantStructures = getRelevantStructures(isLong, mainOrderBlocks, mainFVGs, currentPrice)
+        
+        // 檢查當前比特幣市場狀態
+        val btcMarketState = checkBitcoinMarketState(current, isLong)
+        
         println(buildString {
-            appendLine("========= SMC多時間週期分析信號 =========")
+            appendLine("========= BTC/USDT SMC分析信號 =========")
             appendLine("時間: ${formatTime(current.closeTime)}")
             appendLine("主趨勢: ${if (isLong) "上升" else "下降"}")
             appendLine("信號類型: ${if (isLong) "做多" else "做空"}")
             appendLine("信號強度: ${String.format("%.2f", signalStrength)}/100")
+            appendLine("當前價格: ${String.format("%.2f", currentPrice)}")
             appendLine("價格區間: ${current.lowPrice} - ${current.highPrice}")
-            appendLine("進場價格: ${String.format("%.2f", riskManagement.entryPrice)}")
+            
+            // 添加比特幣市場狀態
+            appendLine("比特幣市場狀態:")
+            btcMarketState.forEach { line ->
+                appendLine("- $line")
+            }
+            
+            // 添加進場策略建議
+            appendLine("進場策略:")
+            if (abs(entryPriceDiff) < 0.2) {
+                appendLine("- 建議立即進場，當前價格接近理想進場點")
+                // 比特幣特有建議
+                appendLine("- 考慮分批進場，首批60%，剩餘40%設置低於當前價格0.5%的限價單")
+            } else if (entryPriceDiff > 0 && isLong || entryPriceDiff < 0 && !isLong) {
+                appendLine("- 建議等待回調至 ${String.format("%.2f", riskManagement.entryPrice)} (距當前價格: $entryPriceDiffStr)")
+                // 比特幣特有建議
+                appendLine("- 設置價格提醒，BTC波動較大，可能快速達到目標價格")
+            } else {
+                appendLine("- 建議限價單掛單於 ${String.format("%.2f", riskManagement.entryPrice)} (距當前價格: $entryPriceDiffStr)")
+                // 比特幣特有建議
+                appendLine("- 同時設置止損單，BTC可能快速突破後回撤")
+            }
+            
+            // 添加相關市場結構信息
+            if (relevantStructures.isNotEmpty()) {
+                appendLine("相關市場結構:")
+                relevantStructures.forEach { structure ->
+                    appendLine("- $structure")
+                }
+            }
+            
             appendLine("風險管理:")
-            appendLine("- 止損: ${String.format("%.2f", riskManagement.stopLoss)}")
+            // 比特幣特有的風險管理建議
+            appendLine("- 建議風險: 帳戶資金的 ${if (signalStrength > 80) "1.5%" else "1%"} (BTC波動較大，建議降低風險)")
+            appendLine("- 止損價格: ${String.format("%.2f", riskManagement.stopLoss)} (風險: ${String.format("%.2f", riskPercentage)}%)")
+            appendLine("- 建議使用追蹤止損，設置${if (isLong) "下跌" else "上漲"}1%啟動，${if (isLong) "回撤" else "回落"}0.5%觸發")
             appendLine("- 目標位:")
             riskManagement.targets.forEachIndexed { index, target ->
-                appendLine("  ${index + 1}) ${String.format("%.2f", target.price)} (平倉${target.percentage}%)")
+                val targetRR = abs(target.price - riskManagement.entryPrice) / abs(riskManagement.entryPrice - riskManagement.stopLoss)
+                appendLine("  ${index + 1}) ${String.format("%.2f", target.price)} (${String.format("%.1f", targetRR)}R, 平倉${target.percentage}%)")
             }
             appendLine("- 綜合風險報酬比: ${String.format("%.2f", riskManagement.riskRewardRatio)}")
+            
+            // 添加交易執行建議
+            appendLine("執行建議:")
+            appendLine("- ${if (riskManagement.riskRewardRatio >= 3) "強烈推薦" else if (riskManagement.riskRewardRatio >= 2) "建議執行" else "謹慎考慮"}該交易")
+            appendLine("- 建議使用${if (signalStrength > 75) "市價單" else "限價單"}進場")
+            appendLine("- 止損單類型: ${if (riskPercentage < 1.5) "市價止損" else "觸發止損"}")
+            
+            // 比特幣特有的額外建議
+            appendLine("比特幣特有建議:")
+            appendLine("- 注意資金費率，避免在資金費率過高時持有大量倉位")
+            appendLine("- 關注BTC主導地位指數變化，主導地位上升時信號更可靠")
+            appendLine("- 留意美聯儲消息和宏觀經濟數據，可能導致BTC大幅波動")
+            appendLine("- 建議同時關注ETH/BTC比率，作為市場情緒參考")
+            
             appendLine("=======================================")
         })
 
         // 觸發回調，通知有新的交易信號
         onTradeSignal?.invoke()
+    }
+
+    // 檢查比特幣市場狀態
+    private fun checkBitcoinMarketState(current: Kline, isLong: Boolean): List<String> {
+        val states = mutableListOf<String>()
+        
+        // 檢查交易量
+        val volume = current.volume.toDouble()
+        val quoteVolume = volume * current.closePrice.toDouble() // 計算USDT交易量
+        
+        if (quoteVolume > 500_000_000) { // 5億USDT
+            states.add("交易量異常高，可能有大幅波動")
+        } else if (quoteVolume < 100_000_000) { // 1億USDT
+            states.add("交易量較低，可能缺乏持續動力")
+        }
+        
+        // 檢查K線實體與影線比例
+        val bodySize = abs(current.openPrice.toDouble() - current.closePrice.toDouble())
+        val totalRange = current.highPrice.toDouble() - current.lowPrice.toDouble()
+        val bodyRatio = if (totalRange > 0) bodySize / totalRange else 0.0
+        
+        if (bodyRatio > 0.8) {
+            states.add("強勁的${if (current.closePrice > current.openPrice) "買入" else "賣出"}壓力，趨勢可能持續")
+        } else if (bodyRatio < 0.3) {
+            states.add("市場猶豫，存在較大不確定性")
+        }
+        
+        // 根據當前趨勢添加建議
+        if (isLong) {
+            states.add("上升趨勢中，關注上方整數關口阻力位")
+            // 檢查是否接近整數關口
+            val nextRoundNumber = (current.closePrice.toDouble() / 1000).toInt() * 1000 + 1000
+            if (nextRoundNumber - current.closePrice.toDouble() < 500) {
+                states.add("接近${nextRoundNumber}整數關口，可能有阻力")
+            }
+        } else {
+            states.add("下降趨勢中，關注下方整數關口支撐位")
+            // 檢查是否接近整數關口
+            val prevRoundNumber = (current.closePrice.toDouble() / 1000).toInt() * 1000
+            if (current.closePrice.toDouble() - prevRoundNumber < 500) {
+                states.add("接近${prevRoundNumber}整數關口，可能有支撐")
+            }
+        }
+        
+        return states
+    }
+
+    // 獲取與當前價格相關的市場結構
+    private fun getRelevantStructures(
+        isLong: Boolean,
+        orderBlocks: List<OrderBlock>,
+        fvgs: List<PriceRange>,
+        currentPrice: Double
+    ): List<String> {
+        val structures = mutableListOf<String>()
+        
+        // 篩選相關的訂單塊
+        val relevantOBs = orderBlocks.filter { ob ->
+            if (isLong) {
+                ob.type == OrderBlockType.BULLISH && 
+                currentPrice > ob.startPrice && 
+                currentPrice < ob.endPrice * 1.05
+            } else {
+                ob.type == OrderBlockType.BEARISH && 
+                currentPrice < ob.endPrice && 
+                currentPrice > ob.startPrice * 0.95
+            }
+        }
+        
+        // 篩選相關的FVG
+        val relevantFVGs = fvgs.filter { fvg ->
+            if (isLong) {
+                fvg.type == GapType.BULLISH && 
+                currentPrice > fvg.start && 
+                currentPrice < fvg.end * 1.05
+            } else {
+                fvg.type == GapType.BEARISH && 
+                currentPrice < fvg.end && 
+                currentPrice > fvg.start * 0.95
+            }
+        }
+        
+        // 添加訂單塊信息
+        relevantOBs.forEach { ob ->
+            structures.add("${if (ob.type == OrderBlockType.BULLISH) "看漲" else "看跌"}訂單塊: ${String.format("%.2f", ob.startPrice)} - ${String.format("%.2f", ob.endPrice)}, 強度: ${String.format("%.1f", ob.strength)}")
+        }
+        
+        // 添加FVG信息
+        relevantFVGs.forEach { fvg ->
+            structures.add("${if (fvg.type == GapType.BULLISH) "看漲" else "看跌"}FVG: ${String.format("%.2f", fvg.start)} - ${String.format("%.2f", fvg.end)}, 強度: ${String.format("%.1f", fvg.strength)}%")
+        }
+        
+        return structures
     }
 
     private fun calculateRiskManagement(
